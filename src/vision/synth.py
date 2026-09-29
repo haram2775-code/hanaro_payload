@@ -1,8 +1,9 @@
 """Spec B — 합성영상·정답 데이터 생성기 (다중 낙하산 표적 + 정확한 형상).
 
 설정과 seed가 주어지면 결정론적으로 시험 영상과 표적별 정답값(GT) CSV를 생성한다.
-표적은 실제 Rocketman 낙하산 사양(가정/설정값, configs/parachute_specs.md 참조)을
-기반으로 반구형 캐노피·전개 단계·현삭·관측각을 모델링한다.
+표적은 실제 Rocketman 낙하산 사양(출처: the-rocketman.com 제품 페이지, 2026-09-29,
+configs/parachute_specs.md 참조)을 기반으로 형상을 모델링한다:
+Main=Toroidal/Annular(중앙 spill hole), Drogue=평면-원형(4-line). 전개 단계·현삭·관측각 포함.
 
 주의(공통 규칙): 형상 모델링의 정확도가 실제 검출 성공을 보장하지 않는다.
 절대 거리/m/s는 다루지 않으며 모든 크기·중심은 픽셀 단위다.
@@ -34,10 +35,12 @@ STATE_LOST = "LOST"
 class Target:
     """합성 표적 하나. 픽셀 단위. 모든 값은 설정값/가정."""
     name: str = "main"
-    kind: str = "hemispherical"           # 캐노피 형상
+    kind: str = "toroidal"                 # 캐노피 형상 (Main=toroidal, Drogue=round)
     color: tuple[int, int, int] = (40, 150, 240)   # BGR
     alt_color: tuple[int, int, int] = (240, 240, 240)
-    n_panels: int = 8
+    n_panels: int = 12
+    n_shroud: int = 12
+    spill_hole_ratio: float = 0.176        # toroidal 중앙 구멍 비율
     start_diameter: float = 120.0          # 시작 등가직경(px)
     start_center: tuple[float, float] = (320.0, 200.0)
     velocity_px: tuple[float, float] = (0.0, 0.0)  # 프레임당 중심 이동
@@ -54,7 +57,8 @@ class Target:
 
     def canopy(self) -> Canopy:
         return Canopy(kind=self.kind, color=self.color, alt_color=self.alt_color,
-                      n_panels=self.n_panels)
+                      n_panels=self.n_panels, n_shroud=self.n_shroud,
+                      spill_hole_ratio=self.spill_hole_ratio)
 
 
 @dataclass
@@ -201,22 +205,33 @@ def _cfg_to_dict(cfg: SceneConfig) -> dict:
     return d
 
 
-# --- Rocketman 사양 기반 표적 프리셋 (가정/설정값, configs/parachute_specs.md) ---
+# --- Rocketman 사양 기반 표적 프리셋 (출처: the-rocketman.com 제품 페이지, 2026-09-29) ---
 def drogue_target(**kw) -> Target:
-    """Drogue: 3 ft, Cd 0.97, 반구/원형 계열. 고속 구간 → 작고 빠름."""
+    """Drogue: Rocketman Pro-Experimental 3 ft, Cd 0.97.
+
+    형상 출처: Pro Experimental Drogue 제품 페이지 → 4-line 평면/원형 캐노피,
+    spill hole 없음. → kind=round, gore/현삭 4개. 고속 구간이라 작고 빠름.
+    """
     base = dict(
         name="drogue", kind="round", color=(50, 90, 210), alt_color=(230, 230, 230),
-        n_panels=6, start_diameter=42.0, view_elev_deg=20.0,
+        n_panels=4, n_shroud=4, spill_hole_ratio=0.0,
+        start_diameter=42.0, view_elev_deg=20.0,
     )
     base.update(kw)
     return Target(**base)
 
 
 def main_target(**kw) -> Target:
-    """Main: 10 ft, Cd 2.2, 고성능 반구형(HPC). 저속 구간 → 크고 느림."""
+    """Main: Rocketman High-Performance CD 2.2, 10 ft.
+
+    형상 출처: HPC CD 2.2 제품 페이지(120in 행) → Type "Toroidal/Annular/Iris",
+    gore 12, spill hole 21.12"/120"≈17.6%. → kind=toroidal, 중앙 구멍 있음.
+    저속 구간이라 크고 느림.
+    """
     base = dict(
-        name="main", kind="hemispherical", color=(40, 150, 240), alt_color=(240, 240, 240),
-        n_panels=8, start_diameter=130.0, view_elev_deg=28.0,
+        name="main", kind="toroidal", color=(40, 150, 240), alt_color=(240, 240, 240),
+        n_panels=12, n_shroud=12, spill_hole_ratio=0.176,
+        start_diameter=130.0, view_elev_deg=28.0,
     )
     base.update(kw)
     return Target(**base)
