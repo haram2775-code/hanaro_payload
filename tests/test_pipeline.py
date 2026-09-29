@@ -266,6 +266,51 @@ def test_mesh_scenes_additive():
         assert all(t.render_backend == "mesh" for t in tgts)
 
 
+def test_view_elev_interpolation():
+    """관측각 보간: end=None이면 고정, 지정 시 시작→끝 선형."""
+    import math
+    fixed = synth.Target(view_elev_deg=30.0, view_elev_deg_end=None)
+    assert synth._view_elev_rad(fixed, 0, 100) == math.radians(30.0)
+    assert synth._view_elev_rad(fixed, 99, 100) == math.radians(30.0)
+    vary = synth.Target(view_elev_deg=85.0, view_elev_deg_end=45.0)
+    assert abs(synth._view_elev_rad(vary, 0, 100) - math.radians(85.0)) < 1e-9
+    assert abs(synth._view_elev_rad(vary, 99, 100) - math.radians(45.0)) < 1e-9
+    mid = math.degrees(synth._view_elev_rad(vary, 49, 100))  # ~중간
+    assert 60.0 < mid < 70.0, f"중간 관측각이 시작/끝 사이여야 함: {mid}"
+
+
+def test_descend_view_scenes_additive_and_varying():
+    """관측각-하강 시나리오가 추가되고, 관측각이 실제로 변하며(end 지정), 이름 충돌 없음."""
+    dv = {s.name for s in synth.descend_view_scenes()}
+    assert dv == {"descend_view_body", "descend_view_ground"}
+    others = ({s.name for s in synth.regression_scenes()} |
+              {s.name for s in synth.sequence_scenes()} |
+              {s.name for s in synth.irec_scenes()} |
+              {s.name for s in synth.mesh_scenes()})
+    assert dv.isdisjoint(others), "관측각-하강 이름은 기존과 겹치면 안 됨"
+    for s in synth.descend_view_scenes():
+        for t in s.targets:
+            assert t.view_elev_deg_end is not None, "관측각이 변해야 함(end 지정)"
+            assert t.view_elev_deg_end != t.view_elev_deg
+
+
+def test_descend_view_projection_changes():
+    """하강 시나리오: 관측각 변화로 투영 종횡비가 시작과 끝에서 달라진다(3D 반영)."""
+    from vision.canopy import Canopy, canopy_projected_bbox
+    s = [x for x in synth.descend_view_scenes() if x.name == "descend_view_body"][0]
+    t = s.targets[0]
+    cnp = t.canopy()
+    import math
+    e0 = synth._view_elev_rad(t, 0, s.frames)
+    e1 = synth._view_elev_rad(t, s.frames - 1, s.frames)
+    _, _, w0, h0 = canopy_projected_bbox((320, 200), 120.0, cnp, view_elev=e0,
+                                         img_shape=(480, 640))
+    _, _, w1, h1 = canopy_projected_bbox((320, 200), 120.0, cnp, view_elev=e1,
+                                         img_shape=(480, 640))
+    ar0 = h0 / max(1, w0); ar1 = h1 / max(1, w1)
+    assert abs(ar0 - ar1) > 0.05, f"관측각 변화가 투영에 반영돼야 함: {ar0:.2f} vs {ar1:.2f}"
+
+
 def _to_hsv(bgr):
     import cv2
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype("float32")
@@ -316,4 +361,7 @@ if __name__ == "__main__":
     test_mesh_projection_responds_to_view_elev()
     test_mesh_backend_default_off_preserves_2d()
     test_mesh_scenes_additive()
+    test_view_elev_interpolation()
+    test_descend_view_scenes_additive_and_varying()
+    test_descend_view_projection_changes()
     print("ALL TESTS PASSED")

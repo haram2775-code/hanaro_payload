@@ -49,7 +49,8 @@ class Target:
     start_center: tuple[float, float] = (320.0, 200.0)
     velocity_px: tuple[float, float] = (0.0, 0.0)  # 프레임당 중심 이동
     diameter_growth_per_frame: float = 1.0  # 크기 배율(접근>1, 이격<1)
-    view_elev_deg: float = 25.0            # 관측 고도각(도)
+    view_elev_deg: float = 25.0            # 관측 고도각(도, 시작)
+    view_elev_deg_end: float | None = None # 끝 관측각(도). None이면 고정각(기존 동작).
     # 전개: [start,end] 구간에서 inflation 0.2→1.0
     inflate_range: tuple[int, int] | None = None
     inflate_from: float = 0.2
@@ -230,6 +231,19 @@ def _dynamics_offset(i: int, t: Target) -> tuple[float, float, float, float, flo
     return dx, dy, roll, tilt_x, tilt_y
 
 
+def _view_elev_rad(t: Target, local_i: int, span: int) -> float:
+    """관측각을 프레임에 따라 보간(도→rad). view_elev_deg_end가 None이면 고정각.
+
+    span은 이 표적/단계가 활성인 총 프레임 수(0..span-1 동안 시작→끝 선형 보간).
+    """
+    a0 = t.view_elev_deg
+    if t.view_elev_deg_end is None or span <= 1:
+        return math.radians(a0)
+    frac = min(1.0, max(0.0, local_i / (span - 1)))
+    a = a0 + (t.view_elev_deg_end - a0) * frac
+    return math.radians(a)
+
+
 def generate(cfg: SceneConfig, out_dir: Path) -> dict:
     """영상 + 표적별 GT CSV + 메타데이터를 생성한다."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +329,7 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> TrackabilityRes
 
             dxo, dyo, roll, tx, ty = _dynamics_offset(i, t)
             infl = _inflation(i, t)
-            view_elev = math.radians(t.view_elev_deg)
+            view_elev = _view_elev_rad(t, i, cfg.frames)
             cx, cy, d = st["cx"] + dxo, st["cy"] + dyo, st["d"]
 
             visible = 1
@@ -417,7 +431,7 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> TrackabilityResult:
             local_i = i - m["start"]
             dxo, dyo, roll, tx, ty = _dynamics_offset(local_i, t)
             infl = _seq_inflation(i, m["start"], stage.inflate_frames, stage.inflate_from)
-            view_elev = math.radians(t.view_elev_deg)
+            view_elev = _view_elev_rad(t, local_i, m["end"] - m["start"])
             cx, cy, d = s["cx"] + dxo, s["cy"] + dyo, s["d"]
 
             next_start = marks[si + 1]["start"] if si + 1 < len(marks) else None
@@ -626,6 +640,36 @@ def mesh_scenes() -> list[SceneConfig]:
     ]
 
 
+# --- 관측각이 하강하며 변하는 시나리오 (camera_geometry.md 기반, 추가 경로) ---
+def descend_view_scenes() -> list[SceneConfig]:
+    """하강하며 시선각이 변하는 시나리오. mesh 백엔드로 3D 자세가 실제로 기운다.
+
+    가정(configs/camera_geometry.md):
+    - descend_view_body: 페이로드 카메라가 더 빨리 멀어지는 본체(main 계열)를 올려다봄.
+      관측각 85°→45°, 분리로 표적이 작아짐(diameter_growth<1).
+    - descend_view_ground: 지상 카메라가 하강 표적을 봄. 관측각 30°→70°, 접근으로 커짐.
+    기존 시퀀스/IREC/mesh/2D 시나리오는 그대로 보존.
+    """
+    body = main_target(
+        render_backend="mesh", start_center=(320.0, 150.0), start_diameter=140.0,
+        velocity_px=(0.1, 0.9), diameter_growth_per_frame=0.985,   # 멀어짐→작아짐
+        view_elev_deg=85.0, view_elev_deg_end=45.0,
+        swing_amp_px=9.0, swing_period_frames=46.0, rotate_deg_per_frame=0.8,
+        wind_drift_px=0.15)
+    ground = main_target(
+        render_backend="mesh", start_center=(300.0, 210.0), start_diameter=70.0,
+        velocity_px=(0.2, 0.3), diameter_growth_per_frame=1.012,   # 접근→커짐
+        view_elev_deg=30.0, view_elev_deg_end=70.0,
+        swing_amp_px=12.0, swing_period_frames=50.0, rotate_deg_per_frame=1.0,
+        wind_drift_px=0.2)
+    return [
+        SceneConfig(name="descend_view_body", frames=120,
+                    realism=irec_realism(), targets=[body]),
+        SceneConfig(name="descend_view_ground", frames=120,
+                    realism=irec_realism(terrain_frac=0.16), targets=[ground]),
+    ]
+
+
 # --- 회귀/시연 시나리오 ---
 def regression_scenes() -> list[SceneConfig]:
     return [
@@ -672,8 +716,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     out_dir = Path(args.out)
-    # 기존 회귀 + 시퀀스 + IREC 사실성 + 3D mesh 시나리오(모두 추가 경로). 이름 충돌 없음.
-    scenes = regression_scenes() + sequence_scenes() + irec_scenes() + mesh_scenes()
+    # 기존 회귀 + 시퀀스 + IREC 사실성 + 3D mesh + 관측각-하강 시나리오(모두 추가 경로).
+    scenes = (regression_scenes() + sequence_scenes() + irec_scenes()
+              + mesh_scenes() + descend_view_scenes())
     if args.scene != "all":
         scenes = [s for s in scenes if s.name == args.scene]
         if not scenes:
