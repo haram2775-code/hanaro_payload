@@ -105,6 +105,57 @@ def test_dual_target_gt_has_both():
     assert len(rows) == 20 * 2
 
 
+def test_sequence_timeline_transitions():
+    """시퀀스 타임라인: 단계가 순서대로, 겹침 없이 이어지고 각 단계가 전개완료 지점을 갖는다."""
+    seq = synth.drogue_then_main_sequence()
+    marks = seq.timeline()
+    assert len(marks) == 2
+    d, m = marks
+    # drogue가 먼저, main이 그 뒤에 시작
+    assert d["start"] == 0
+    assert m["start"] >= d["end"], "겹침 없음(기본 overlap=0)이면 main은 drogue 종료 후 시작"
+    # 각 단계에 전개완료(deploying_end) 경계가 활성 구간 안에 있음
+    assert d["start"] < d["deploying_end"] <= d["end"]
+    assert m["start"] < m["deploying_end"] <= m["end"]
+
+
+def test_sequence_single_active_stage_and_state_flow():
+    """시퀀스 생성물: 프레임당 활성 단계 1개만 기록되고, drogue가 DEPLOYED 도달 후 main이 등장."""
+    base = ROOT / "output" / "_test_tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    scene = [s for s in synth.sequence_scenes() if s.name == "seq_drogue_then_main"][0]
+    synth.generate(scene, base)
+    rows = list(csv.DictReader((base / "seq_drogue_then_main_gt.csv").read_text(encoding="utf-8").splitlines()))
+    assert rows, "시퀀스 GT가 비어있음"
+
+    # 1) 프레임당 활성 단계 1개(겹침 없음): frame_id 중복 없음
+    frame_ids = [r["frame_id"] for r in rows]
+    assert len(frame_ids) == len(set(frame_ids)), "겹침 없는 시퀀스인데 같은 프레임에 2개 기록됨"
+
+    # 2) drogue가 먼저, main이 나중 — 마지막 drogue 프레임 < 첫 main 프레임
+    drogue_frames = [int(r["frame_id"]) for r in rows if r["target_name"] == "drogue"]
+    main_frames = [int(r["frame_id"]) for r in rows if r["target_name"] == "main"]
+    assert drogue_frames and main_frames, "두 단계 모두 나타나야 함"
+    assert max(drogue_frames) < min(main_frames), "drogue 단계가 main 단계보다 먼저 끝나야 함"
+
+    # 3) 상태 전이: drogue 단계에 DEPLOYING과 DEPLOYED가 모두 나타남(전개완료 확인)
+    drogue_states = {r["gt_state"] for r in rows if r["target_name"] == "drogue"}
+    assert synth.STATE_DEPLOYING in drogue_states, "drogue 전개 중 상태가 있어야 함"
+    assert synth.STATE_DEPLOYED in drogue_states, "drogue 전개 완료(DEPLOYED) 상태가 있어야 함"
+    # main도 전개 중 상태를 가짐
+    main_states = {r["gt_state"] for r in rows if r["target_name"] == "main"}
+    assert synth.STATE_DEPLOYING in main_states
+
+
+def test_regression_scenes_preserved():
+    """기존 진입점 보존: regression_scenes()에 기존 이름들이 그대로 있고 sequence 필드가 없다."""
+    names = {s.name for s in synth.regression_scenes()}
+    for expected in ("main_only", "dual_drogue_main", "dual_transition", "main_occlusion"):
+        assert expected in names, f"기존 시나리오 {expected} 보존돼야 함"
+    # 기존 시나리오는 시퀀스를 쓰지 않음(다중표적 경로 유지)
+    assert all(s.sequence is None for s in synth.regression_scenes())
+
+
 def _strip_timing(csv_text: str) -> list[list[str]]:
     out = []
     for i, line in enumerate(csv_text.strip().splitlines()):
@@ -139,4 +190,7 @@ if __name__ == "__main__":
     test_validity_track_but_size_separable()
     test_end_to_end_and_reproducible()
     test_dual_target_gt_has_both()
+    test_sequence_timeline_transitions()
+    test_sequence_single_active_stage_and_state_flow()
+    test_regression_scenes_preserved()
     print("ALL TESTS PASSED")
