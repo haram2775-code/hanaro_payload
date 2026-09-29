@@ -22,6 +22,10 @@ import numpy as np
 
 from . import code_version
 from .canopy import Canopy, render_canopy, canopy_projected_bbox, canopy_projected_area
+from .scene import (
+    RealismConfig, make_sky, apply_canopy_lighting, apply_atmosphere_and_sensor,
+    sky_color_at, frame_trackability, TrackabilityResult,
+)
 
 # GT 상태 어휘는 Spec A와 정합한다.
 STATE_TRACK = "TRACK"
@@ -54,6 +58,11 @@ class Target:
     occlude_fraction: float = 0.6
     # 상실
     lost_range: tuple[int, int] | None = None
+    # --- 낙하 동역학(사실성, 옵션). 기본 0 → 기존 동작 보존. 값은 설정값/가정. ---
+    swing_amp_px: float = 0.0        # 진자 흔들림 진폭(px)
+    swing_period_frames: float = 40.0  # 진자 주기(프레임)
+    rotate_deg_per_frame: float = 0.0  # 캐노피 자전(도/프레임)
+    wind_drift_px: float = 0.0       # 프레임당 수평 바람 표류(px)
 
     def canopy(self) -> Canopy:
         return Canopy(kind=self.kind, color=self.color, alt_color=self.alt_color,
@@ -162,6 +171,8 @@ class SceneConfig:
     targets: list[Target] = field(default_factory=lambda: [Target()])
     # 순차 전개 시퀀스(1급 개념). None이면 기존 다중표적 경로를 쓴다(동작 보존).
     sequence: "DeploymentSequence | None" = None
+    # IREC 사실성 레이어(옵션). None이면 기존 회색-하늘 경로 그대로(동작 보존).
+    realism: "RealismConfig | None" = None
 
 
 def _in_range(i: int, rng: tuple[int, int] | None) -> bool:
@@ -181,6 +192,9 @@ def _inflation(i: int, t: Target) -> float:
 
 
 def _make_background(cfg: SceneConfig, rng) -> np.ndarray:
+    # 사실성 레이어가 켜져 있으면 IREC 하늘/지형을 만든다(기존 경로 대체 X, 분기).
+    if cfg.realism is not None and cfg.realism.enabled:
+        return np.clip(make_sky(cfg.width, cfg.height, cfg.realism, rng), 0, 255).astype(np.uint8)
     frame = np.full((cfg.height, cfg.width, 3), cfg.bg_gray, dtype=np.float32)
     if cfg.sky_gradient:
         grad = np.linspace(cfg.bg_gray + 40, cfg.bg_gray - 20, cfg.height, dtype=np.float32)
@@ -189,6 +203,23 @@ def _make_background(cfg: SceneConfig, rng) -> np.ndarray:
     if cfg.bg_noise > 0:
         frame += rng.normal(0.0, cfg.bg_noise, frame.shape)
     return np.clip(frame, 0, 255).astype(np.uint8)
+
+
+def _dynamics_offset(i: int, t: Target) -> tuple[float, float, float]:
+    """프레임 i에서 진자 흔들림/바람 표류/자전을 계산한다(사실성 옵션).
+
+    반환: (dx, dy, roll_deg). 기본값이면 (0,0,0)이라 기존 동작과 동일.
+    """
+    dx = 0.0
+    dy = 0.0
+    if t.swing_amp_px > 0 and t.swing_period_frames > 0:
+        phase = 2.0 * math.pi * i / t.swing_period_frames
+        dx += t.swing_amp_px * math.sin(phase)
+        dy += 0.3 * t.swing_amp_px * math.sin(2.0 * phase)  # 수직은 2배 주파수 소진폭
+    if t.wind_drift_px:
+        dx += t.wind_drift_px * i
+    roll = t.rotate_deg_per_frame * i
+    return dx, dy, roll
 
 
 def generate(cfg: SceneConfig, out_dir: Path) -> dict:
@@ -219,12 +250,13 @@ def generate(cfg: SceneConfig, out_dir: Path) -> dict:
         ])
 
         if cfg.sequence is not None:
-            _render_sequence(cfg, writer, gt, rng)
+            track = _render_sequence(cfg, writer, gt, rng)
         else:
-            _render_targets(cfg, writer, gt, rng, state)
+            track = _render_targets(cfg, writer, gt, rng, state)
 
     writer.release()
 
+    realism_on = cfg.realism is not None and cfg.realism.enabled
     meta = {
         "spec": "B-synthetic",
         "code_version": code_version(),
@@ -233,11 +265,20 @@ def generate(cfg: SceneConfig, out_dir: Path) -> dict:
         "source_kind": "synthetic",
         "video_id": cfg.name,
         "mode": "sequence" if cfg.sequence is not None else "targets",
+        "realism": "irec" if realism_on else "none",
         "n_targets": len(cfg.targets),
         "target_names": [t.name for t in cfg.targets],
         "sequence_stages": (
             [s.target.name for s in cfg.sequence.stages] if cfg.sequence else None
         ),
+        "trackability": {
+            "frames_measured": track.frames,
+            "trackable_frames": track.trackable_frames,
+            "trackable_ratio": round(track.trackable_ratio, 4),
+            "mean_michelson_contrast": round(track.mean_michelson, 4),
+            "mean_target_width_px": round(track.mean_target_width_px, 2),
+            "criteria": "trackable = (유효폭>=8px) and (Michelson 대비>=0.12). 가정치.",
+        },
         "config": _cfg_to_dict(cfg),
         "video_path": str(video_path),
         "gt_path": str(gt_path),
@@ -247,8 +288,14 @@ def generate(cfg: SceneConfig, out_dir: Path) -> dict:
     return meta
 
 
-def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> None:
-    """기존 다중표적 경로(동작 보존): 매 프레임 모든 표적을 동시에 렌더/기록."""
+def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> TrackabilityResult:
+    """기존 다중표적 경로(동작 보존): 매 프레임 모든 표적을 동시에 렌더/기록.
+
+    realism이 켜지면 동역학(흔들림/자전/바람)·조명·하늘색 spill hole·광학/센서
+    결함을 추가로 적용한다(기본값이면 아무 영향 없음).
+    """
+    rl = cfg.realism
+    tr = TrackabilityResult()
     for i in range(cfg.frames):
         frame = _make_background(cfg, rng)
 
@@ -258,9 +305,10 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> None:
             st["cx"] += t.velocity_px[0]
             st["cy"] += t.velocity_px[1]
 
+            dxo, dyo, roll = _dynamics_offset(i, t)
             infl = _inflation(i, t)
             view_elev = math.radians(t.view_elev_deg)
-            cx, cy, d = st["cx"], st["cy"], st["d"]
+            cx, cy, d = st["cx"] + dxo, st["cy"] + dyo, st["d"]
 
             visible = 1
             tstate = STATE_TRACK
@@ -277,13 +325,23 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> None:
                 tstate = STATE_LOST
             else:
                 cnp = t.canopy()
+                hole = sky_color_at(rl, cfg.height, cy) if (rl and rl.enabled) else None
                 render_canopy(frame, (cx, cy), d, cnp,
                               inflation=infl, view_elev=view_elev,
-                              occlude_top_frac=occ_frac)
+                              occlude_top_frac=occ_frac, roll_deg=roll, hole_color=hole)
                 bx, by, bw, bh = canopy_projected_bbox(
                     (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
                 if (bx < 0 or by < 0 or bx + bw >= cfg.width or by + bh >= cfg.height):
                     tstate = STATE_CLIPPED
+                if rl and rl.enabled:
+                    apply_canopy_lighting(frame, (cx, cy), bw // 2, bh // 2, rl)
+                    # 대표 표적(첫 표적)의 추적성 지표 수집
+                    if ti == 0:
+                        res = frame_trackability(frame, (cx, cy), bw // 2, bh // 2)
+                        tr.frames += 1
+                        tr.trackable_frames += int(res["trackable"])
+                        tr.mean_michelson += res["michelson"]
+                        tr.mean_target_width_px += res["width_px"]
 
             area = canopy_projected_area(d, t.canopy(), inflation=infl, view_elev=view_elev)
             gt.writerow([
@@ -293,22 +351,32 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> None:
                 visible, tstate,
             ])
 
-        if cfg.blur_ksize and cfg.blur_ksize >= 3 and cfg.blur_ksize % 2 == 1:
+        if rl and rl.enabled:
+            frame = apply_atmosphere_and_sensor(frame, rl, rng)
+        elif cfg.blur_ksize and cfg.blur_ksize >= 3 and cfg.blur_ksize % 2 == 1:
             frame = cv2.GaussianBlur(frame, (cfg.blur_ksize, cfg.blur_ksize), 0)
 
         writer.write(frame)
 
+    if tr.frames:
+        tr.mean_michelson /= tr.frames
+        tr.mean_target_width_px /= tr.frames
+    return tr
 
-def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> None:
+
+def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> TrackabilityResult:
     """순차 전개 시퀀스 경로(1급 개념): 매 프레임 활성 단계만 렌더/기록.
 
     각 단계는 자신의 활성 구간 [start, end) 동안만 등장한다. 전개 완료(DEPLOYED)가
     확인되면 다음 단계로 전이하며, overlap_frames > 0인 단계에서만 다음 단계와
     잠깐 겹쳐 보인다(HANDOFF). 그 외에는 매 순간 활성 단계 1개만 존재한다.
+    realism이 켜지면 동역학/조명/하늘 spill hole/광학·센서 결함을 추가한다.
     """
     seq = cfg.sequence
     marks = seq.timeline()
     total = cfg.frames
+    rl = cfg.realism
+    tr = TrackabilityResult()
 
     # 단계별 동적 상태(중심·직경) — 활성 시작 시점에 초기화.
     st = [{"cx": s.target.start_center[0], "cy": s.target.start_center[1],
@@ -316,6 +384,7 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> None:
 
     for i in range(total):
         frame = _make_background(cfg, rng)
+        active_idx = None
 
         for si, stage in enumerate(seq.stages):
             m = marks[si]
@@ -331,19 +400,32 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> None:
                 s["cx"] += t.velocity_px[0]
                 s["cy"] += t.velocity_px[1]
 
+            local_i = i - m["start"]
+            dxo, dyo, roll = _dynamics_offset(local_i, t)
             infl = _seq_inflation(i, m["start"], stage.inflate_frames, stage.inflate_from)
             view_elev = math.radians(t.view_elev_deg)
-            cx, cy, d = s["cx"], s["cy"], s["d"]
+            cx, cy, d = s["cx"] + dxo, s["cy"] + dyo, s["d"]
 
             next_start = marks[si + 1]["start"] if si + 1 < len(marks) else None
             stage_state = _seq_stage_state(i, m, stage, next_start)
 
             cnp = t.canopy()
-            render_canopy(frame, (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
+            hole = sky_color_at(rl, cfg.height, cy) if (rl and rl.enabled) else None
+            render_canopy(frame, (cx, cy), d, cnp, inflation=infl, view_elev=view_elev,
+                          roll_deg=roll, hole_color=hole)
             bx, by, bw, bh = canopy_projected_bbox(
                 (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
             if (bx < 0 or by < 0 or bx + bw >= cfg.width or by + bh >= cfg.height):
                 stage_state = STATE_CLIPPED
+            if rl and rl.enabled:
+                apply_canopy_lighting(frame, (cx, cy), bw // 2, bh // 2, rl)
+                if active_idx is None:  # 첫(주) 활성 단계의 추적성만 집계
+                    active_idx = si
+                    res = frame_trackability(frame, (cx, cy), bw // 2, bh // 2)
+                    tr.frames += 1
+                    tr.trackable_frames += int(res["trackable"])
+                    tr.mean_michelson += res["michelson"]
+                    tr.mean_target_width_px += res["width_px"]
 
             area = canopy_projected_area(d, cnp, inflation=infl, view_elev=view_elev)
             gt.writerow([
@@ -353,10 +435,17 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> None:
                 1, stage_state,
             ])
 
-        if cfg.blur_ksize and cfg.blur_ksize >= 3 and cfg.blur_ksize % 2 == 1:
+        if rl and rl.enabled:
+            frame = apply_atmosphere_and_sensor(frame, rl, rng)
+        elif cfg.blur_ksize and cfg.blur_ksize >= 3 and cfg.blur_ksize % 2 == 1:
             frame = cv2.GaussianBlur(frame, (cfg.blur_ksize, cfg.blur_ksize), 0)
 
         writer.write(frame)
+
+    if tr.frames:
+        tr.mean_michelson /= tr.frames
+        tr.mean_target_width_px /= tr.frames
+    return tr
 
 
 def _cfg_to_dict(cfg: SceneConfig) -> dict:
@@ -427,6 +516,72 @@ def sequence_scenes() -> list[SceneConfig]:
     ]
 
 
+# --- IREC 사실성 프리셋 (가정/설정값, configs/irec_conditions.md 참조) ---
+def irec_realism(**kw) -> RealismConfig:
+    """IREC(Spaceport America, 정오, 사막) 회수 영상 조건 프리셋. 모두 가정치."""
+    base = dict(
+        enabled=True,
+        sky_top=(150, 95, 45), sky_horizon=(205, 180, 150),   # 진파랑→옅은 지평선
+        clouds=0.22, terrain_frac=0.0,
+        sun_dir_deg=60.0, sun_intensity=0.35, backlight=0.18,
+        heat_shimmer=0.6, camera_jitter_px=0.0, motion_blur=0,
+        sensor_noise=5.0, shot_noise=0.03, jpeg_quality=85,
+    )
+    base.update(kw)
+    return RealismConfig(**base)
+
+
+def _irec_sequence() -> DeploymentSequence:
+    """IREC 시퀀스: 추적 가능하도록 표적을 더 크게, 동역학(흔들림/자전/바람) 부여."""
+    return DeploymentSequence(stages=[
+        Stage(
+            target=drogue_target(
+                start_center=(330.0, 140.0), start_diameter=70.0,
+                velocity_px=(-0.3, 1.3), diameter_growth_per_frame=1.003,
+                swing_amp_px=6.0, swing_period_frames=26.0,
+                rotate_deg_per_frame=2.2, wind_drift_px=0.15,
+            ),
+            inflate_frames=12, inflate_from=0.25, hold_frames=18, overlap_frames=0,
+        ),
+        Stage(
+            target=main_target(
+                start_center=(300.0, 240.0), start_diameter=90.0,
+                velocity_px=(0.15, 0.45), diameter_growth_per_frame=1.006,
+                swing_amp_px=10.0, swing_period_frames=44.0,
+                rotate_deg_per_frame=1.1, wind_drift_px=0.1,
+            ),
+            inflate_frames=28, inflate_from=0.2, hold_frames=26, overlap_frames=0,
+        ),
+    ])
+
+
+def irec_scenes() -> list[SceneConfig]:
+    """IREC 사실성 시나리오(추가 경로). 기존 시나리오·시퀀스는 그대로 보존."""
+    seq = _irec_sequence()
+    return [
+        # 순차 전개(drogue→main), 진한 파란 하늘 + 대기/센서 결함
+        SceneConfig(name="irec_seq_drogue_then_main", frames=seq.total_frames(),
+                    sequence=seq, realism=irec_realism()),
+        # 근접 하강: 큰 main, 진자 흔들림/자전, 지평선 근처 지형 밴드
+        SceneConfig(name="irec_main_descent", frames=120,
+                    realism=irec_realism(terrain_frac=0.18, clouds=0.15),
+                    targets=[main_target(
+                        start_center=(300.0, 150.0), start_diameter=150.0,
+                        velocity_px=(0.3, 1.6), diameter_growth_per_frame=1.004,
+                        swing_amp_px=14.0, swing_period_frames=48.0,
+                        rotate_deg_per_frame=0.9, wind_drift_px=0.2)]),
+        # 원거리 회수: 표적이 작고(추적 난이도↑) 아지랑이/노이즈 강함
+        SceneConfig(name="irec_main_far", frames=100,
+                    realism=irec_realism(heat_shimmer=1.1, sensor_noise=7.0,
+                                         jpeg_quality=72, clouds=0.3),
+                    targets=[main_target(
+                        start_center=(360.0, 170.0), start_diameter=54.0,
+                        velocity_px=(-0.4, 0.7), diameter_growth_per_frame=1.006,
+                        swing_amp_px=5.0, swing_period_frames=40.0,
+                        rotate_deg_per_frame=1.4, wind_drift_px=0.25)]),
+    ]
+
+
 # --- 회귀/시연 시나리오 ---
 def regression_scenes() -> list[SceneConfig]:
     return [
@@ -473,8 +628,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     out_dir = Path(args.out)
-    # 기존 회귀 시나리오 + 새 시퀀스 시나리오(추가 경로). 이름 충돌 없음.
-    scenes = regression_scenes() + sequence_scenes()
+    # 기존 회귀 + 시퀀스 + IREC 사실성 시나리오(모두 추가 경로). 이름 충돌 없음.
+    scenes = regression_scenes() + sequence_scenes() + irec_scenes()
     if args.scene != "all":
         scenes = [s for s in scenes if s.name == args.scene]
         if not scenes:

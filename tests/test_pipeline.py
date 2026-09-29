@@ -154,6 +154,65 @@ def test_regression_scenes_preserved():
         assert expected in names, f"기존 시나리오 {expected} 보존돼야 함"
     # 기존 시나리오는 시퀀스를 쓰지 않음(다중표적 경로 유지)
     assert all(s.sequence is None for s in synth.regression_scenes())
+    # 기존 시나리오는 사실성 레이어를 쓰지 않음(회색-하늘 경로 유지)
+    assert all(s.realism is None for s in synth.regression_scenes())
+
+
+def test_realism_off_preserves_legacy_background():
+    """realism=None이면 기존 회색-하늘 경로 그대로(채도 거의 0)."""
+    import numpy as np
+    cfg = synth.SceneConfig(name="_bgtest", width=64, height=64, realism=None)
+    rng = np.random.default_rng(0)
+    bg = synth._make_background(cfg, rng)
+    hsv = _to_hsv(bg)
+    # 회색 배경도 채널별 노이즈로 소량의 chroma가 생기지만(≈16), IREC 파란 하늘(≈118)과는
+    # 확연히 구분된다. 무채색 상한을 넉넉히 30으로 둔다.
+    assert hsv[..., 1].mean() < 30, "기존 배경은 무채색(회색)이어야 함"
+
+
+def test_irec_realism_bluer_and_more_trackable():
+    """IREC 사실성 배경은 회색 배경보다 채도가 높고(파란 하늘), 추적성이 개선된다."""
+    import numpy as np
+    # 파란 하늘 채도 확인
+    rl = synth.irec_realism(heat_shimmer=0.0, clouds=0.0, jpeg_quality=0)
+    cfg = synth.SceneConfig(name="_skytest", width=80, height=80, realism=rl)
+    rng = np.random.default_rng(0)
+    bg = synth._make_background(cfg, rng)
+    hsv = _to_hsv(bg)
+    assert hsv[..., 1].mean() > 40, "IREC 하늘은 유채색(파랑)이어야 함"
+
+    # 추적성: IREC 시퀀스 결과 meta에 지표가 있고, 대비/폭 기준을 상당수 프레임이 충족
+    base = ROOT / "output" / "_test_tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    scene = [s for s in synth.irec_scenes() if s.name == "irec_seq_drogue_then_main"][0]
+    scene.frames = 24
+    meta = synth.generate(scene, base)
+    tk = meta["trackability"]
+    assert tk["frames_measured"] > 0
+    assert tk["mean_target_width_px"] >= 8.0, "표적이 추적 가능한 최소 크기 이상이어야 함"
+    assert tk["trackable_ratio"] >= 0.5, f"IREC 프레임의 절반 이상은 추적 가능해야 함: {tk}"
+
+
+def test_irec_scenes_additive():
+    """IREC 시나리오가 존재하고, 기존/시퀀스 시나리오와 이름 충돌이 없다."""
+    irec = {s.name for s in synth.irec_scenes()}
+    assert "irec_seq_drogue_then_main" in irec
+    reg = {s.name for s in synth.regression_scenes()}
+    seq = {s.name for s in synth.sequence_scenes()}
+    assert irec.isdisjoint(reg) and irec.isdisjoint(seq), "IREC 이름은 기존과 겹치면 안 됨"
+    # 모든 IREC 시나리오는 사실성이 켜져 있어야 함
+    assert all(s.realism and s.realism.enabled for s in synth.irec_scenes())
+
+
+def test_dynamics_offset_default_is_zero():
+    """동역학 파라미터 기본값이면 오프셋 0 — 기존 동작 보존."""
+    t = synth.main_target()  # swing/rotate/wind 모두 기본 0
+    assert synth._dynamics_offset(10, t) == (0.0, 0.0, 0.0)
+
+
+def _to_hsv(bgr):
+    import cv2
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype("float32")
 
 
 def _strip_timing(csv_text: str) -> list[list[str]]:
@@ -193,4 +252,8 @@ if __name__ == "__main__":
     test_sequence_timeline_transitions()
     test_sequence_single_active_stage_and_state_flow()
     test_regression_scenes_preserved()
+    test_realism_off_preserves_legacy_background()
+    test_irec_realism_bluer_and_more_trackable()
+    test_irec_scenes_additive()
+    test_dynamics_offset_default_is_zero()
     print("ALL TESTS PASSED")

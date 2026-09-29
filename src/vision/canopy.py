@@ -74,6 +74,8 @@ def render_canopy(
     inflation: float = 1.0,     # 0=reefed, 1=full 팽창
     view_elev: float = 0.0,     # 관측 고도각(rad). 0=정면(옆), pi/2=바로 아래
     occlude_top_frac: float = 0.0,  # 상단 가림 비율
+    roll_deg: float = 0.0,      # 캐노피 면내 자전(도). 사실성 옵션.
+    hole_color: tuple[int, int, int] | None = None,  # toroidal spill hole 색(하늘 통과)
 ) -> None:
     """캐노피 + shroud line을 img에 그린다(in place)."""
     cx, cy = center
@@ -84,9 +86,9 @@ def render_canopy(
         return
 
     if canopy.kind == "toroidal":
-        _render_toroidal(img, cx, cy, ax, ay, canopy, infl)
+        _render_toroidal(img, cx, cy, ax, ay, canopy, infl, roll_deg, hole_color)
     elif canopy.kind == "round":
-        _render_round(img, cx, cy, ax, ay, canopy)
+        _render_round(img, cx, cy, ax, ay, canopy, roll_deg)
     else:
         _render_dome(img, cx, cy, ax, ay, canopy, height)
 
@@ -107,17 +109,19 @@ def render_canopy(
                       (int(cx + ax) + 4, top + cover_h), (40, 40, 40), thickness=-1)
 
 
-def _render_toroidal(img, cx, cy, ax, ay, canopy: Canopy, infl):
+def _render_toroidal(img, cx, cy, ax, ay, canopy: Canopy, infl, roll_deg=0.0, hole_color=None):
     """도넛형(annular) 캐노피: 교대 gore 링 + 중앙 spill hole.
 
     apex가 안으로 당겨져 위에서/비스듬히 보면 가운데가 뚫린 링으로 보인다.
+    roll_deg만큼 gore 배치를 회전시켜 자전을 표현한다. hole_color가 주어지면
+    spill hole을 그 색(=뒤의 하늘)으로 칠해 '구멍으로 하늘이 보이는' 실제 형상을 낸다.
     """
     cxi, cyi = int(cx), int(cy)
     # 바깥 링을 gore별 부채꼴로 채운다(전체 360도, 링 모양).
     seg = 360.0 / max(1, canopy.n_panels)
     for i in range(canopy.n_panels):
-        a0 = i * seg
-        a1 = (i + 1) * seg
+        a0 = roll_deg + i * seg
+        a1 = roll_deg + (i + 1) * seg
         col = canopy.color if i % 2 == 0 else canopy.alt_color
         cv2.ellipse(img, (cxi, cyi), (ax, ay), 0, a0, a1, col,
                     thickness=-1, lineType=cv2.LINE_AA)
@@ -129,24 +133,25 @@ def _render_toroidal(img, cx, cy, ax, ay, canopy: Canopy, infl):
                 thickness=max(1, ax // 8), lineType=cv2.LINE_AA)
     cv2.addWeighted(overlay, 0.30, img, 0.70, 0, img)
 
-    # 중앙 spill hole: 배경이 보이도록 어둡게(하늘 배경보다 어두운 원)
-    # — 배경색을 모르므로 캐노피보다 확실히 어두운 색으로 '구멍'을 표현.
+    # 중앙 spill hole: 실제로는 '뒤의 하늘'이 보인다. hole_color(하늘색)가 주어지면
+    # 그 색으로, 없으면(기존 동작) 캐노피보다 어두운 색으로 구멍을 표현한다.
     hx = max(1, int(round(ax * canopy.spill_hole_ratio)))
     hy = max(1, int(round(ay * canopy.spill_hole_ratio)))
-    cv2.ellipse(img, (cxi, cyi), (hx, hy), 0, 0, 360, (35, 35, 40),
+    fill = hole_color if hole_color is not None else (35, 35, 40)
+    cv2.ellipse(img, (cxi, cyi), (hx, hy), 0, 0, 360, fill,
                 thickness=-1, lineType=cv2.LINE_AA)
     # spill hole 테두리 loop(밝은 링)
     cv2.ellipse(img, (cxi, cyi), (hx, hy), 0, 0, 360,
                 _scale_color(canopy.alt_color, 0.9), thickness=1, lineType=cv2.LINE_AA)
 
 
-def _render_round(img, cx, cy, ax, ay, canopy: Canopy):
+def _render_round(img, cx, cy, ax, ay, canopy: Canopy, roll_deg=0.0):
     """단순 평면/원형 캐노피(drogue). 소수 gore + 반경 음영, spill hole 없음."""
     cxi, cyi = int(cx), int(cy)
     seg = 360.0 / max(1, canopy.n_panels)
     for i in range(canopy.n_panels):
-        a0 = i * seg
-        a1 = (i + 1) * seg
+        a0 = roll_deg + i * seg
+        a1 = roll_deg + (i + 1) * seg
         col = canopy.color if i % 2 == 0 else canopy.alt_color
         cv2.ellipse(img, (cxi, cyi), (ax, ay), 0, a0, a1, col,
                     thickness=-1, lineType=cv2.LINE_AA)
