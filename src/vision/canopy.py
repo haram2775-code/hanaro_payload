@@ -40,6 +40,7 @@ class Canopy:
     shroud_len_ratio: float = 1.3      # confluence까지 거리 / 캐노피 반경
     edge_darken: float = 0.55          # 가장자리 음영 계수(구형감)
     spill_hole_ratio: float = 0.176    # 중앙 spill hole 지름 / 캐노피 지름 (toroidal)
+    render_backend: str = "2d"         # "2d"(기존) | "mesh"(3D). 기본 2d → 동작 보존.
 
 
 def _aspect_for_kind(kind: str) -> float:
@@ -76,8 +77,16 @@ def render_canopy(
     occlude_top_frac: float = 0.0,  # 상단 가림 비율
     roll_deg: float = 0.0,      # 캐노피 면내 자전(도). 사실성 옵션.
     hole_color: tuple[int, int, int] | None = None,  # toroidal spill hole 색(하늘 통과)
+    tilt_x_deg: float = 0.0,    # 진자 흔들림 기울임 X(도) — mesh 백엔드에서 사용
+    tilt_y_deg: float = 0.0,    # 진자 흔들림 기울임 Y(도) — mesh 백엔드에서 사용
 ) -> None:
     """캐노피 + shroud line을 img에 그린다(in place)."""
+    if canopy.render_backend == "mesh":
+        _render_canopy_mesh(img, center, diameter_px, canopy,
+                            inflation=inflation, view_elev=view_elev,
+                            roll_deg=roll_deg, tilt_x_deg=tilt_x_deg,
+                            tilt_y_deg=tilt_y_deg)
+        return
     cx, cy = center
     width, height, infl = _shape_geometry(diameter_px, canopy, inflation, view_elev)
     ax = int(round(width))
@@ -184,8 +193,16 @@ def _render_dome(img, cx, cy, ax, ay, canopy: Canopy, height):
 
 
 def canopy_projected_bbox(center, diameter_px, canopy: Canopy, *,
-                          inflation=1.0, view_elev=0.0) -> tuple[int, int, int, int]:
-    """렌더된 캐노피(현삭 제외)의 투영 bbox."""
+                          inflation=1.0, view_elev=0.0,
+                          roll_deg=0.0, tilt_x_deg=0.0, tilt_y_deg=0.0,
+                          img_shape=(480, 640)) -> tuple[int, int, int, int]:
+    """렌더된 캐노피(현삭 제외)의 투영 bbox. mesh 백엔드는 실루엣에서 계산."""
+    if canopy.render_backend == "mesh":
+        _mesh, m, R, cam, scale = _build_mesh_and_pose(
+            center, diameter_px, canopy, inflation=inflation, view_elev=view_elev,
+            roll_deg=roll_deg, tilt_x_deg=tilt_x_deg, tilt_y_deg=tilt_y_deg)
+        met = _mesh.mesh_projected_metrics(m, R, center, scale, cam, img_shape)
+        return met["bbox"]
     cx, cy = center
     width, height, _ = _shape_geometry(diameter_px, canopy, inflation, view_elev)
     if canopy.kind in ("toroidal", "round"):
@@ -203,8 +220,17 @@ def canopy_projected_bbox(center, diameter_px, canopy: Canopy, *,
     return x, y, w, h
 
 
-def canopy_projected_area(diameter_px, canopy: Canopy, *, inflation=1.0, view_elev=0.0) -> float:
-    """투영 면적(px^2). toroidal은 중앙 spill hole 면적을 제외한다."""
+def canopy_projected_area(diameter_px, canopy: Canopy, *, inflation=1.0, view_elev=0.0,
+                          center=None, roll_deg=0.0, tilt_x_deg=0.0, tilt_y_deg=0.0,
+                          img_shape=(480, 640)) -> float:
+    """투영 면적(px^2). mesh 백엔드는 실루엣 면적(구멍 자동 반영)."""
+    if canopy.render_backend == "mesh":
+        c = center if center is not None else (img_shape[1] / 2, img_shape[0] / 2)
+        _mesh, m, R, cam, scale = _build_mesh_and_pose(
+            c, diameter_px, canopy, inflation=inflation, view_elev=view_elev,
+            roll_deg=roll_deg, tilt_x_deg=tilt_x_deg, tilt_y_deg=tilt_y_deg)
+        met = _mesh.mesh_projected_metrics(m, R, c, scale, cam, img_shape)
+        return met["area"]
     width, height, _ = _shape_geometry(diameter_px, canopy, inflation, view_elev)
     if canopy.kind == "toroidal":
         outer = math.pi * width * height
@@ -218,3 +244,33 @@ def canopy_projected_area(diameter_px, canopy: Canopy, *, inflation=1.0, view_el
 
 def _scale_color(c, f):
     return tuple(int(max(0, min(255, v * f))) for v in c)
+
+
+# =====================================================================
+# 3D mesh 백엔드 (M1~M4) — vision.mesh 모듈로 위임. 2D 경로는 이 코드를 타지 않는다.
+# =====================================================================
+def _build_mesh_and_pose(center, diameter_px, canopy: Canopy, *,
+                         inflation, view_elev, roll_deg, tilt_x_deg, tilt_y_deg):
+    """메시·자세·스케일·카메라를 렌더/메트릭이 공유하도록 한 곳에서 만든다."""
+    from . import mesh as _mesh  # 지연 임포트(2D 경로엔 불필요)
+    kind = canopy.kind if canopy.kind in ("toroidal", "round") else "round"
+    m = _mesh.build_canopy_mesh(
+        kind, radius=1.0, n_panels=canopy.n_panels,
+        color=canopy.color, alt_color=canopy.alt_color,
+        inflation=inflation, spill_hole_ratio=canopy.spill_hole_ratio,
+        n_shroud=canopy.n_shroud, shroud_len_ratio=canopy.shroud_len_ratio)
+    R = _mesh.pose_matrix(view_elev, roll=math.radians(roll_deg),
+                          tilt_x=math.radians(tilt_x_deg),
+                          tilt_y=math.radians(tilt_y_deg))
+    cam = _mesh.Camera(cx=center[0], cy=center[1])
+    scale = max(1.0, diameter_px / 2.0)
+    return _mesh, m, R, cam, scale
+
+
+def _render_canopy_mesh(img, center, diameter_px, canopy: Canopy, *,
+                        inflation, view_elev, roll_deg, tilt_x_deg, tilt_y_deg):
+    _mesh, m, R, cam, scale = _build_mesh_and_pose(
+        center, diameter_px, canopy, inflation=inflation, view_elev=view_elev,
+        roll_deg=roll_deg, tilt_x_deg=tilt_x_deg, tilt_y_deg=tilt_y_deg)
+    _mesh.render_mesh(img, m, R, center, scale, cam,
+                      shroud_color=canopy.shroud_color)

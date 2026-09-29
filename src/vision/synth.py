@@ -63,11 +63,13 @@ class Target:
     swing_period_frames: float = 40.0  # 진자 주기(프레임)
     rotate_deg_per_frame: float = 0.0  # 캐노피 자전(도/프레임)
     wind_drift_px: float = 0.0       # 프레임당 수평 바람 표류(px)
+    render_backend: str = "2d"       # "2d"(기존) | "mesh"(3D). 기본 2d → 동작 보존.
 
     def canopy(self) -> Canopy:
         return Canopy(kind=self.kind, color=self.color, alt_color=self.alt_color,
                       n_panels=self.n_panels, n_shroud=self.n_shroud,
-                      spill_hole_ratio=self.spill_hole_ratio)
+                      spill_hole_ratio=self.spill_hole_ratio,
+                      render_backend=self.render_backend)
 
 
 # =====================================================================
@@ -205,21 +207,27 @@ def _make_background(cfg: SceneConfig, rng) -> np.ndarray:
     return np.clip(frame, 0, 255).astype(np.uint8)
 
 
-def _dynamics_offset(i: int, t: Target) -> tuple[float, float, float]:
+def _dynamics_offset(i: int, t: Target) -> tuple[float, float, float, float, float]:
     """프레임 i에서 진자 흔들림/바람 표류/자전을 계산한다(사실성 옵션).
 
-    반환: (dx, dy, roll_deg). 기본값이면 (0,0,0)이라 기존 동작과 동일.
+    반환: (dx, dy, roll_deg, tilt_x_deg, tilt_y_deg). 기본값이면 (0,0,0,0,0)이라
+    기존 동작과 동일. tilt_*는 mesh 백엔드에서 진자 기울임으로 쓰인다(2D는 무시).
     """
     dx = 0.0
     dy = 0.0
+    tilt_x = 0.0
+    tilt_y = 0.0
     if t.swing_amp_px > 0 and t.swing_period_frames > 0:
         phase = 2.0 * math.pi * i / t.swing_period_frames
         dx += t.swing_amp_px * math.sin(phase)
         dy += 0.3 * t.swing_amp_px * math.sin(2.0 * phase)  # 수직은 2배 주파수 소진폭
+        # 진자 기울임: 흔들림 위상에 비례해 캐노피가 기운다(최대 ~18도).
+        tilt_y += 18.0 * math.sin(phase) * min(1.0, t.swing_amp_px / 12.0)
+        tilt_x += 6.0 * math.sin(2.0 * phase) * min(1.0, t.swing_amp_px / 12.0)
     if t.wind_drift_px:
         dx += t.wind_drift_px * i
     roll = t.rotate_deg_per_frame * i
-    return dx, dy, roll
+    return dx, dy, roll, tilt_x, tilt_y
 
 
 def generate(cfg: SceneConfig, out_dir: Path) -> dict:
@@ -305,7 +313,7 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> TrackabilityRes
             st["cx"] += t.velocity_px[0]
             st["cy"] += t.velocity_px[1]
 
-            dxo, dyo, roll = _dynamics_offset(i, t)
+            dxo, dyo, roll, tx, ty = _dynamics_offset(i, t)
             infl = _inflation(i, t)
             view_elev = math.radians(t.view_elev_deg)
             cx, cy, d = st["cx"] + dxo, st["cy"] + dyo, st["d"]
@@ -328,9 +336,12 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> TrackabilityRes
                 hole = sky_color_at(rl, cfg.height, cy) if (rl and rl.enabled) else None
                 render_canopy(frame, (cx, cy), d, cnp,
                               inflation=infl, view_elev=view_elev,
-                              occlude_top_frac=occ_frac, roll_deg=roll, hole_color=hole)
+                              occlude_top_frac=occ_frac, roll_deg=roll, hole_color=hole,
+                              tilt_x_deg=tx, tilt_y_deg=ty)
                 bx, by, bw, bh = canopy_projected_bbox(
-                    (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
+                    (cx, cy), d, cnp, inflation=infl, view_elev=view_elev,
+                    roll_deg=roll, tilt_x_deg=tx, tilt_y_deg=ty,
+                    img_shape=(cfg.height, cfg.width))
                 if (bx < 0 or by < 0 or bx + bw >= cfg.width or by + bh >= cfg.height):
                     tstate = STATE_CLIPPED
                 if rl and rl.enabled:
@@ -343,7 +354,10 @@ def _render_targets(cfg: SceneConfig, writer, gt, rng, state) -> TrackabilityRes
                         tr.mean_michelson += res["michelson"]
                         tr.mean_target_width_px += res["width_px"]
 
-            area = canopy_projected_area(d, t.canopy(), inflation=infl, view_elev=view_elev)
+            area = canopy_projected_area(d, t.canopy(), inflation=infl, view_elev=view_elev,
+                                         center=(cx, cy), roll_deg=roll,
+                                         tilt_x_deg=tx, tilt_y_deg=ty,
+                                         img_shape=(cfg.height, cfg.width))
             gt.writerow([
                 i, f"{i / cfg.fps:.6f}", t.name,
                 f"{cx:.3f}", f"{cy:.3f}",
@@ -401,7 +415,7 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> TrackabilityResult:
                 s["cy"] += t.velocity_px[1]
 
             local_i = i - m["start"]
-            dxo, dyo, roll = _dynamics_offset(local_i, t)
+            dxo, dyo, roll, tx, ty = _dynamics_offset(local_i, t)
             infl = _seq_inflation(i, m["start"], stage.inflate_frames, stage.inflate_from)
             view_elev = math.radians(t.view_elev_deg)
             cx, cy, d = s["cx"] + dxo, s["cy"] + dyo, s["d"]
@@ -412,9 +426,11 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> TrackabilityResult:
             cnp = t.canopy()
             hole = sky_color_at(rl, cfg.height, cy) if (rl and rl.enabled) else None
             render_canopy(frame, (cx, cy), d, cnp, inflation=infl, view_elev=view_elev,
-                          roll_deg=roll, hole_color=hole)
+                          roll_deg=roll, hole_color=hole, tilt_x_deg=tx, tilt_y_deg=ty)
             bx, by, bw, bh = canopy_projected_bbox(
-                (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
+                (cx, cy), d, cnp, inflation=infl, view_elev=view_elev,
+                roll_deg=roll, tilt_x_deg=tx, tilt_y_deg=ty,
+                img_shape=(cfg.height, cfg.width))
             if (bx < 0 or by < 0 or bx + bw >= cfg.width or by + bh >= cfg.height):
                 stage_state = STATE_CLIPPED
             if rl and rl.enabled:
@@ -427,7 +443,10 @@ def _render_sequence(cfg: SceneConfig, writer, gt, rng) -> TrackabilityResult:
                     tr.mean_michelson += res["michelson"]
                     tr.mean_target_width_px += res["width_px"]
 
-            area = canopy_projected_area(d, cnp, inflation=infl, view_elev=view_elev)
+            area = canopy_projected_area(d, cnp, inflation=infl, view_elev=view_elev,
+                                         center=(cx, cy), roll_deg=roll,
+                                         tilt_x_deg=tx, tilt_y_deg=ty,
+                                         img_shape=(cfg.height, cfg.width))
             gt.writerow([
                 i, f"{i / cfg.fps:.6f}", t.name,
                 f"{cx:.3f}", f"{cy:.3f}",
@@ -582,6 +601,31 @@ def irec_scenes() -> list[SceneConfig]:
     ]
 
 
+# --- 3D mesh 백엔드 시나리오 (M1~M4). 기존 2D 시나리오·시퀀스는 그대로 보존. ---
+def _mesh_sequence() -> DeploymentSequence:
+    """IREC 시퀀스와 동일 구성이되 캐노피를 3D mesh 백엔드로 렌더."""
+    seq = _irec_sequence()
+    for stg in seq.stages:
+        stg.target.render_backend = "mesh"
+    return seq
+
+
+def mesh_scenes() -> list[SceneConfig]:
+    """3D mesh 렌더 시나리오(추가 경로). 기존 2D/시퀀스/IREC는 무변경."""
+    mseq = _mesh_sequence()
+    md = main_target(render_backend="mesh", start_center=(300.0, 150.0),
+                     start_diameter=150.0, velocity_px=(0.3, 1.4),
+                     diameter_growth_per_frame=1.004, swing_amp_px=14.0,
+                     swing_period_frames=48.0, rotate_deg_per_frame=0.9,
+                     wind_drift_px=0.2, view_elev_deg=55.0)
+    return [
+        SceneConfig(name="mesh_seq_drogue_then_main", frames=mseq.total_frames(),
+                    sequence=mseq, realism=irec_realism()),
+        SceneConfig(name="mesh_main_descent", frames=120, realism=irec_realism(),
+                    targets=[md]),
+    ]
+
+
 # --- 회귀/시연 시나리오 ---
 def regression_scenes() -> list[SceneConfig]:
     return [
@@ -628,8 +672,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     out_dir = Path(args.out)
-    # 기존 회귀 + 시퀀스 + IREC 사실성 시나리오(모두 추가 경로). 이름 충돌 없음.
-    scenes = regression_scenes() + sequence_scenes() + irec_scenes()
+    # 기존 회귀 + 시퀀스 + IREC 사실성 + 3D mesh 시나리오(모두 추가 경로). 이름 충돌 없음.
+    scenes = regression_scenes() + sequence_scenes() + irec_scenes() + mesh_scenes()
     if args.scene != "all":
         scenes = [s for s in scenes if s.name == args.scene]
         if not scenes:

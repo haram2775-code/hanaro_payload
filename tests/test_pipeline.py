@@ -207,7 +207,63 @@ def test_irec_scenes_additive():
 def test_dynamics_offset_default_is_zero():
     """동역학 파라미터 기본값이면 오프셋 0 — 기존 동작 보존."""
     t = synth.main_target()  # swing/rotate/wind 모두 기본 0
-    assert synth._dynamics_offset(10, t) == (0.0, 0.0, 0.0)
+    assert synth._dynamics_offset(10, t) == (0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def test_mesh_backend_renders_and_metrics():
+    """3D mesh 백엔드: 캐노피를 그리고(비지 않음) 실루엣 GT가 유효하다."""
+    import numpy as np
+    from vision.canopy import Canopy, render_canopy, canopy_projected_area, canopy_projected_bbox
+    img = np.zeros((240, 320, 3), dtype=np.uint8)
+    cnp = Canopy(kind="toroidal", render_backend="mesh", n_panels=12, spill_hole_ratio=0.176)
+    render_canopy(img, (160, 120), 120.0, cnp, inflation=1.0, view_elev=1.2)
+    assert img.sum() > 0, "mesh 백엔드가 아무것도 그리지 않음"
+    area = canopy_projected_area(120.0, cnp, inflation=1.0, view_elev=1.2,
+                                 center=(160, 120), img_shape=(240, 320))
+    assert area > 0, "mesh 투영 면적이 0"
+    bx, by, bw, bh = canopy_projected_bbox((160, 120), 120.0, cnp,
+                                           inflation=1.0, view_elev=1.2,
+                                           img_shape=(240, 320))
+    assert bw > 0 and bh > 0
+
+
+def test_mesh_projection_responds_to_view_elev():
+    """관측각이 커질수록(바로 아래에서 볼수록) 투영 종횡비(h/w)가 커진다 — 3D 투영 확인."""
+    from vision.canopy import Canopy, canopy_projected_bbox
+    cnp = Canopy(kind="round", render_backend="mesh", n_panels=8)
+    _, _, w_side, h_side = canopy_projected_bbox((160, 120), 120.0, cnp,
+                                                 inflation=1.0, view_elev=0.2,
+                                                 img_shape=(240, 320))
+    _, _, w_top, h_top = canopy_projected_bbox((160, 120), 120.0, cnp,
+                                               inflation=1.0, view_elev=1.4,
+                                               img_shape=(240, 320))
+    ar_side = h_side / max(1, w_side)
+    ar_top = h_top / max(1, w_top)
+    assert ar_top > ar_side, f"관측각↑에서 종횡비가 커져야 함: side={ar_side:.2f} top={ar_top:.2f}"
+
+
+def test_mesh_backend_default_off_preserves_2d():
+    """render_backend 기본값은 '2d' — 기존 렌더 경로가 유지된다."""
+    from vision.canopy import Canopy
+    assert Canopy().render_backend == "2d"
+    assert synth.Target().render_backend == "2d"
+    # 기존/시퀀스/IREC 시나리오의 모든 표적은 2d 백엔드
+    for s in synth.regression_scenes() + synth.sequence_scenes() + synth.irec_scenes():
+        tgts = s.targets if s.sequence is None else [st.target for st in s.sequence.stages]
+        assert all(t.render_backend == "2d" for t in tgts), f"{s.name}에 mesh 표적이 섞임"
+
+
+def test_mesh_scenes_additive():
+    """mesh 시나리오가 존재하고 기존 이름과 충돌하지 않으며 mesh 백엔드를 쓴다."""
+    mesh = {s.name for s in synth.mesh_scenes()}
+    assert "mesh_seq_drogue_then_main" in mesh and "mesh_main_descent" in mesh
+    others = ({s.name for s in synth.regression_scenes()} |
+              {s.name for s in synth.sequence_scenes()} |
+              {s.name for s in synth.irec_scenes()})
+    assert mesh.isdisjoint(others), "mesh 이름은 기존과 겹치면 안 됨"
+    for s in synth.mesh_scenes():
+        tgts = s.targets if s.sequence is None else [st.target for st in s.sequence.stages]
+        assert all(t.render_backend == "mesh" for t in tgts)
 
 
 def _to_hsv(bgr):
@@ -256,4 +312,8 @@ if __name__ == "__main__":
     test_irec_realism_bluer_and_more_trackable()
     test_irec_scenes_additive()
     test_dynamics_offset_default_is_zero()
+    test_mesh_backend_renders_and_metrics()
+    test_mesh_projection_responds_to_view_elev()
+    test_mesh_backend_default_off_preserves_2d()
+    test_mesh_scenes_additive()
     print("ALL TESTS PASSED")
