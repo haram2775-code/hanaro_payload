@@ -59,13 +59,21 @@ def test_validity_track_but_size_separable():
 def test_end_to_end_and_reproducible(tmp_path=None):
     base = Path(tmp_path) if tmp_path else ROOT / "output" / "_test_tmp"
     base.mkdir(parents=True, exist_ok=True)
-    scene = synth.SceneConfig(name="approach", diameter_growth_per_frame=1.02,
-                              frames=40, seed=7)
+    # 새 다중표적 API: main 표적 접근 시나리오
+    scene = synth.SceneConfig(
+        name="approach", frames=40, seed=7,
+        targets=[synth.main_target(start_center=(320.0, 240.0),
+                                   start_diameter=110.0,
+                                   diameter_growth_per_frame=1.02)],
+    )
     synth.generate(scene, base)
     video = base / "approach.mp4"
     assert video.exists()
+    # GT 스키마에 target_name 컬럼이 포함되는지 확인
+    gt_rows = list(csv.DictReader((base / "approach_gt.csv").read_text(encoding="utf-8").splitlines()))
+    assert gt_rows and gt_rows[0]["target_name"] == "main"
 
-    cfg = AnalyzeConfig(init_bbox=(290, 210, 60, 60), tracker="CSRT")
+    cfg = AnalyzeConfig(init_bbox=(280, 190, 100, 90), tracker="CSRT")
     out1 = base / "run1"
     out2 = base / "run2"
     analyze.run(str(video), str(out1), cfg, source_kind="synthetic")
@@ -78,10 +86,23 @@ def test_end_to_end_and_reproducible(tmp_path=None):
 
     rows = list(csv.DictReader(csv1.splitlines()))
     assert len(rows) == 40
-    # 접근 시나리오: 마지막이 첫 유효 프레임보다 직경이 크다
+    # 접근 시나리오: 마지막 유효 직경이 첫 유효 직경보다 크다
     valid = [r for r in rows if r["size_valid"] == "1"]
     assert valid, "유효 크기 프레임이 없음"
     assert float(valid[-1]["equivalent_diameter_px"]) > float(valid[0]["equivalent_diameter_px"])
+
+
+def test_dual_target_gt_has_both():
+    """두 표적(drogue+main) 시나리오는 프레임당 GT 두 행을 남긴다."""
+    base = ROOT / "output" / "_test_tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    scene = [s for s in synth.regression_scenes() if s.name == "dual_drogue_main"][0]
+    scene.frames = 20
+    synth.generate(scene, base)
+    rows = list(csv.DictReader((base / "dual_drogue_main_gt.csv").read_text(encoding="utf-8").splitlines()))
+    names = {r["target_name"] for r in rows}
+    assert names == {"drogue", "main"}, f"두 표적이 모두 있어야 함: {names}"
+    assert len(rows) == 20 * 2
 
 
 def _strip_timing(csv_text: str) -> list[list[str]]:
@@ -117,4 +138,5 @@ if __name__ == "__main__":
     test_validity_inflating_invalidates_size()
     test_validity_track_but_size_separable()
     test_end_to_end_and_reproducible()
+    test_dual_target_gt_has_both()
     print("ALL TESTS PASSED")

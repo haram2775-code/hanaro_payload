@@ -9,6 +9,7 @@ venv/
 data/synthetic/
 output/run_*/
 output/_test_tmp/
+output/preview_*.png
 
 # 대용량 참고 자료 (sources/의 원본 PDF는 저장소에 넣지 않음)
 sources/*.pdf

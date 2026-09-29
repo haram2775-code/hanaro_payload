@@ -1,9 +1,11 @@
-"""Spec B — 합성영상·정답 데이터 생성기.
+"""Spec B — 합성영상·정답 데이터 생성기 (다중 낙하산 표적 + 정확한 형상).
 
-설정과 seed가 주어지면 결정론적으로 시험 영상과 프레임별 정답값(GT) CSV를 생성한다.
-단순 도형 합성이며, 성공이 실제 낙하산 검출 성공을 의미하지 않는다(요구사항 참조).
+설정과 seed가 주어지면 결정론적으로 시험 영상과 표적별 정답값(GT) CSV를 생성한다.
+표적은 실제 Rocketman 낙하산 사양(가정/설정값, configs/parachute_specs.md 참조)을
+기반으로 반구형 캐노피·전개 단계·현삭·관측각을 모델링한다.
 
-절대 거리/m/s는 다루지 않는다. 모든 크기·중심은 픽셀 단위다.
+주의(공통 규칙): 형상 모델링의 정확도가 실제 검출 성공을 보장하지 않는다.
+절대 거리/m/s는 다루지 않으며 모든 크기·중심은 픽셀 단위다.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import cv2
 import numpy as np
 
 from . import code_version
+from .canopy import Canopy, render_canopy, canopy_projected_bbox, canopy_projected_area
 
 # GT 상태 어휘는 Spec A와 정합한다.
 STATE_TRACK = "TRACK"
@@ -28,39 +31,77 @@ STATE_LOST = "LOST"
 
 
 @dataclass
+class Target:
+    """합성 표적 하나. 픽셀 단위. 모든 값은 설정값/가정."""
+    name: str = "main"
+    kind: str = "hemispherical"           # 캐노피 형상
+    color: tuple[int, int, int] = (40, 150, 240)   # BGR
+    alt_color: tuple[int, int, int] = (240, 240, 240)
+    n_panels: int = 8
+    start_diameter: float = 120.0          # 시작 등가직경(px)
+    start_center: tuple[float, float] = (320.0, 200.0)
+    velocity_px: tuple[float, float] = (0.0, 0.0)  # 프레임당 중심 이동
+    diameter_growth_per_frame: float = 1.0  # 크기 배율(접근>1, 이격<1)
+    view_elev_deg: float = 25.0            # 관측 고도각(도)
+    # 전개: [start,end] 구간에서 inflation 0.2→1.0
+    inflate_range: tuple[int, int] | None = None
+    inflate_from: float = 0.2
+    # 가림
+    occlude_range: tuple[int, int] | None = None
+    occlude_fraction: float = 0.6
+    # 상실
+    lost_range: tuple[int, int] | None = None
+
+    def canopy(self) -> Canopy:
+        return Canopy(kind=self.kind, color=self.color, alt_color=self.alt_color,
+                      n_panels=self.n_panels)
+
+
+@dataclass
 class SceneConfig:
     """합성 시나리오 설정. 모든 값은 설정값/가정이며 확정 요구조건이 아니다."""
-    name: str = "static"
+    name: str = "main_only"
     width: int = 640
     height: int = 480
     fps: float = 30.0
     frames: int = 90
     seed: int = 1234
-    bg_gray: int = 40           # 배경 밝기 (0-255)
-    bg_noise: float = 3.0       # 배경 가우시안 노이즈 표준편차
-    target_gray: int = 210      # 표적 밝기
-    start_diameter: float = 60.0  # 시작 등가직경(px)
-    # 크기 프로파일: 프레임 진행에 따른 직경 배율(1.0=정지). approach>1, recede<1
-    diameter_growth_per_frame: float = 1.0
-    start_center: tuple[float, float] = (320.0, 240.0)
-    velocity_px: tuple[float, float] = (0.0, 0.0)  # 프레임당 중심 이동(px)
-    blur_ksize: int = 0          # 0이면 블러 없음(홀수만 유효)
-    # 가림: [start_frame, end_frame] 구간에서 표적 상단을 가림 막대로 덮음
-    occlude_range: tuple[int, int] | None = None
-    occlude_fraction: float = 0.6   # 가려지는 표적 높이 비율
-    # 팽창: [start,end] 구간에서 직경을 빠르게 키움
-    inflate_range: tuple[int, int] | None = None
-    inflate_rate: float = 1.06      # 팽창 구간의 프레임당 직경 배율
-    # 상실: [start,end] 구간에서 표적을 그리지 않음
-    lost_range: tuple[int, int] | None = None
+    bg_gray: int = 70            # 하늘 배경 밝기
+    bg_noise: float = 3.0
+    sky_gradient: bool = True    # 위→아래 밝기 그라디언트(하늘)
+    blur_ksize: int = 0
+    targets: list[Target] = field(default_factory=lambda: [Target()])
 
 
 def _in_range(i: int, rng: tuple[int, int] | None) -> bool:
     return rng is not None and rng[0] <= i <= rng[1]
 
 
+def _inflation(i: int, t: Target) -> float:
+    if t.inflate_range is None:
+        return 1.0
+    s, e = t.inflate_range
+    if i < s:
+        return t.inflate_from
+    if i > e:
+        return 1.0
+    frac = (i - s) / max(1, e - s)
+    return t.inflate_from + (1.0 - t.inflate_from) * frac
+
+
+def _make_background(cfg: SceneConfig, rng) -> np.ndarray:
+    frame = np.full((cfg.height, cfg.width, 3), cfg.bg_gray, dtype=np.float32)
+    if cfg.sky_gradient:
+        grad = np.linspace(cfg.bg_gray + 40, cfg.bg_gray - 20, cfg.height, dtype=np.float32)
+        frame = np.repeat(grad[:, None, None], cfg.width, axis=1)
+        frame = np.repeat(frame, 3, axis=2)
+    if cfg.bg_noise > 0:
+        frame += rng.normal(0.0, cfg.bg_noise, frame.shape)
+    return np.clip(frame, 0, 255).astype(np.uint8)
+
+
 def generate(cfg: SceneConfig, out_dir: Path) -> dict:
-    """영상 + GT CSV + 메타데이터를 생성한다. 요약 dict를 반환한다."""
+    """영상 + 표적별 GT CSV + 메타데이터를 생성한다."""
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(cfg.seed)
 
@@ -73,76 +114,67 @@ def generate(cfg: SceneConfig, out_dir: Path) -> dict:
     if not writer.isOpened():
         raise RuntimeError(f"VideoWriter 열기 실패: {video_path}")
 
-    cx, cy = cfg.start_center
-    diameter = cfg.start_diameter
+    # 표적별 동적 상태
+    state = [{"cx": t.start_center[0], "cy": t.start_center[1],
+              "d": t.start_diameter} for t in cfg.targets]
 
     with open(gt_path, "w", newline="", encoding="utf-8") as f:
         gt = csv.writer(f)
         gt.writerow([
-            "frame_id", "timestamp_s", "gt_center_x_px", "gt_center_y_px",
-            "gt_area_px2", "gt_diameter_px", "gt_visible", "gt_state",
+            "frame_id", "timestamp_s", "target_name",
+            "gt_center_x_px", "gt_center_y_px",
+            "gt_area_px2", "gt_diameter_px", "gt_inflation",
+            "gt_visible", "gt_state",
         ])
 
         for i in range(cfg.frames):
-            # 배경
-            frame = np.full((cfg.height, cfg.width, 3), cfg.bg_gray, dtype=np.uint8)
-            if cfg.bg_noise > 0:
-                noise = rng.normal(0.0, cfg.bg_noise, frame.shape)
-                frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            frame = _make_background(cfg, rng)
 
-            # 크기 갱신
-            growth = cfg.diameter_growth_per_frame
-            if _in_range(i, cfg.inflate_range):
-                growth = cfg.inflate_rate
-            diameter = max(2.0, diameter * growth)
+            for ti, t in enumerate(cfg.targets):
+                st = state[ti]
+                st["d"] = max(2.0, st["d"] * t.diameter_growth_per_frame)
+                st["cx"] += t.velocity_px[0]
+                st["cy"] += t.velocity_px[1]
 
-            # 중심 갱신
-            cx += cfg.velocity_px[0]
-            cy += cfg.velocity_px[1]
+                infl = _inflation(i, t)
+                view_elev = math.radians(t.view_elev_deg)
+                cx, cy, d = st["cx"], st["cy"], st["d"]
 
-            radius = diameter / 2.0
-            area = math.pi * radius * radius
+                visible = 1
+                tstate = STATE_TRACK
+                occ_frac = 0.0
 
-            visible = 1
-            state = STATE_TRACK
-            if _in_range(i, cfg.inflate_range):
-                state = STATE_INFLATING
+                if _in_range(i, t.inflate_range):
+                    tstate = STATE_INFLATING
+                if _in_range(i, t.occlude_range):
+                    occ_frac = t.occlude_fraction
+                    tstate = STATE_OCCLUDED
 
-            lost = _in_range(i, cfg.lost_range)
-            if lost:
-                visible = 0
-                state = STATE_LOST
-            else:
-                # 표적을 원으로 그림
-                cv2.circle(frame, (int(round(cx)), int(round(cy))),
-                           int(round(radius)), (cfg.target_gray,) * 3, thickness=-1)
+                if _in_range(i, t.lost_range):
+                    visible = 0
+                    tstate = STATE_LOST
+                else:
+                    cnp = t.canopy()
+                    render_canopy(frame, (cx, cy), d, cnp,
+                                  inflation=infl, view_elev=view_elev,
+                                  occlude_top_frac=occ_frac)
+                    bx, by, bw, bh = canopy_projected_bbox(
+                        (cx, cy), d, cnp, inflation=infl, view_elev=view_elev)
+                    if (bx < 0 or by < 0 or bx + bw >= cfg.width or by + bh >= cfg.height):
+                        tstate = STATE_CLIPPED
 
-                # 가림 막대
-                if _in_range(i, cfg.occlude_range):
-                    top = int(round(cy - radius))
-                    cover_h = int(round(2 * radius * cfg.occlude_fraction))
-                    cv2.rectangle(
-                        frame,
-                        (int(round(cx - radius)) - 4, top - 4),
-                        (int(round(cx + radius)) + 4, top + cover_h),
-                        (cfg.bg_gray,) * 3, thickness=-1,
-                    )
-                    state = STATE_OCCLUDED
-
-                # 화면 잘림 판정 (경계에 표적이 닿음)
-                if (cx - radius < 0 or cx + radius >= cfg.width or
-                        cy - radius < 0 or cy + radius >= cfg.height):
-                    state = STATE_CLIPPED
+                area = canopy_projected_area(d, t.canopy(), inflation=infl, view_elev=view_elev)
+                gt.writerow([
+                    i, f"{i / cfg.fps:.6f}", t.name,
+                    f"{cx:.3f}", f"{cy:.3f}",
+                    f"{area:.3f}", f"{d:.3f}", f"{infl:.3f}",
+                    visible, tstate,
+                ])
 
             if cfg.blur_ksize and cfg.blur_ksize >= 3 and cfg.blur_ksize % 2 == 1:
                 frame = cv2.GaussianBlur(frame, (cfg.blur_ksize, cfg.blur_ksize), 0)
 
             writer.write(frame)
-            ts = i / cfg.fps
-            gt.writerow([
-                i, f"{ts:.6f}", f"{cx:.3f}", f"{cy:.3f}",
-                f"{area:.3f}", f"{diameter:.3f}", visible, state,
-            ])
 
     writer.release()
 
@@ -153,36 +185,83 @@ def generate(cfg: SceneConfig, out_dir: Path) -> dict:
         "numpy_version": np.__version__,
         "source_kind": "synthetic",
         "video_id": cfg.name,
-        "config": asdict(cfg),
+        "n_targets": len(cfg.targets),
+        "target_names": [t.name for t in cfg.targets],
+        "config": _cfg_to_dict(cfg),
         "video_path": str(video_path),
         "gt_path": str(gt_path),
+        "note": "형상 정확도가 실제 검출 성공을 보장하지 않음(공통 규칙). 절대 거리/속도 없음.",
     }
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta
 
 
-# --- 최소 회귀 시나리오 (요구사항 R4) ---
+def _cfg_to_dict(cfg: SceneConfig) -> dict:
+    d = asdict(cfg)
+    return d
+
+
+# --- Rocketman 사양 기반 표적 프리셋 (가정/설정값, configs/parachute_specs.md) ---
+def drogue_target(**kw) -> Target:
+    """Drogue: 3 ft, Cd 0.97, 반구/원형 계열. 고속 구간 → 작고 빠름."""
+    base = dict(
+        name="drogue", kind="round", color=(50, 90, 210), alt_color=(230, 230, 230),
+        n_panels=6, start_diameter=42.0, view_elev_deg=20.0,
+    )
+    base.update(kw)
+    return Target(**base)
+
+
+def main_target(**kw) -> Target:
+    """Main: 10 ft, Cd 2.2, 고성능 반구형(HPC). 저속 구간 → 크고 느림."""
+    base = dict(
+        name="main", kind="hemispherical", color=(40, 150, 240), alt_color=(240, 240, 240),
+        n_panels=8, start_diameter=130.0, view_elev_deg=28.0,
+    )
+    base.update(kw)
+    return Target(**base)
+
+
+# --- 회귀/시연 시나리오 ---
 def regression_scenes() -> list[SceneConfig]:
     return [
-        SceneConfig(name="static", diameter_growth_per_frame=1.0),
-        SceneConfig(name="approach", diameter_growth_per_frame=1.02),
-        SceneConfig(name="recede", diameter_growth_per_frame=0.985),
-        SceneConfig(name="small_target", start_diameter=18.0),
-        SceneConfig(name="occlusion", occlude_range=(30, 55)),
-        SceneConfig(name="inflating", inflate_range=(20, 45)),
-        SceneConfig(name="lost_return", lost_range=(35, 50)),
-        SceneConfig(name="clip_out", start_center=(120.0, 240.0),
-                    velocity_px=(-6.0, 0.0)),
+        SceneConfig(name="main_only", targets=[main_target()]),
+        SceneConfig(name="main_approach",
+                    targets=[main_target(diameter_growth_per_frame=1.015)]),
+        SceneConfig(name="main_inflating",
+                    targets=[main_target(inflate_range=(10, 35), start_diameter=130.0)]),
+        SceneConfig(name="drogue_only",
+                    targets=[drogue_target(velocity_px=(1.5, 2.5))]),
+        # 두 표적 동시: drogue(작고 빠름, 위) + main(크고 느림, 아래)
+        SceneConfig(name="dual_drogue_main", frames=110, targets=[
+            drogue_target(start_center=(430.0, 120.0), velocity_px=(-0.8, 1.2),
+                          diameter_growth_per_frame=0.995),
+            main_target(start_center=(250.0, 300.0), velocity_px=(0.4, 0.6),
+                        diameter_growth_per_frame=1.008,
+                        inflate_range=(5, 30)),
+        ]),
+        # 전이 시연: drogue가 상실되고 main이 전개(단계 전환 모사)
+        SceneConfig(name="dual_transition", frames=120, targets=[
+            drogue_target(start_center=(360.0, 130.0), velocity_px=(-0.5, 1.0),
+                          lost_range=(55, 119)),
+            main_target(start_center=(300.0, 280.0), start_diameter=40.0,
+                        inflate_range=(50, 85), diameter_growth_per_frame=1.004),
+        ]),
+        SceneConfig(name="main_occlusion",
+                    targets=[main_target(occlude_range=(30, 55))]),
+        SceneConfig(name="main_clip_out",
+                    targets=[main_target(start_center=(140.0, 240.0),
+                                         velocity_px=(-5.0, 0.0))]),
     ]
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Spec B 합성영상·정답 생성기")
+    p = argparse.ArgumentParser(description="Spec B 합성영상·정답 생성기 (다중 낙하산)")
     p.add_argument("--out", default="data/synthetic", help="출력 폴더")
     p.add_argument("--scene", default="all",
-                   help="시나리오 이름 또는 'all'(모든 회귀 시나리오)")
-    p.add_argument("--seed", type=int, default=None, help="seed 재정의")
-    p.add_argument("--frames", type=int, default=None, help="frames 재정의")
+                   help="시나리오 이름 또는 'all'")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--frames", type=int, default=None)
     return p
 
 
@@ -201,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.frames is not None:
             s.frames = args.frames
         meta = generate(s, out_dir)
-        print(f"생성: {meta['video_path']}  GT: {meta['gt_path']}")
+        print(f"생성: {meta['video_path']}  표적: {meta['target_names']}  GT: {meta['gt_path']}")
     return 0
 
 
