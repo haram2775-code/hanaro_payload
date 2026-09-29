@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 생성물 (합성영상·분석 출력은 재생성 가능하므로 커밋하지 않음)
+data/synthetic/
+output/run_*/
+output/_test_tmp/
+
+# 대용량 참고 자료 (sources/의 원본 PDF는 저장소에 넣지 않음)
+sources/*.pdf
+tmp/
+
+# Kiro 임시 파일
+.kiro/settings/*.lock
+
+# OS
+desktop.ini
+Thumbs.db
+.DS_Store
