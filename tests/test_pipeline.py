@@ -390,6 +390,31 @@ def test_lite_tracker_end_to_end_and_relative_motion():
     assert labels & {"APPROACH", "RECEDE", "HOLD", "LOST"}, f"상대운동 라벨 없음: {labels}"
 
 
+def test_bench_pi_smoke_and_reuses_interface():
+    """Pi 벤치: 기존 tracker_lite/gimbal 인터페이스를 재사용하고 산출물(CSV/요약/리포트)을 낸다."""
+    base = ROOT / "output" / "_test_tmp" / "bench"
+    from vision import bench_pi
+    # 벤치가 재사용하는 인터페이스가 실제로 그 모듈들에서 온 것인지 확인(추가·무변경).
+    from vision.tracker_lite import LiteTracker as _LT, RoiConfig as _RC
+    from vision.gimbal import GimbalErrorModel as _GEM
+    assert bench_pi.LiteTracker is _LT and bench_pi.RoiConfig is _RC
+    assert bench_pi.GimbalErrorModel is _GEM
+    # 가벼운 합성 프레임으로 소수 프레임만 측정(디코드 제외)
+    s = bench_pi.run_bench(frames=12, width=320, height=240, warmup=2,
+                           out_dir=str(base), seed=0)
+    # 예산 필드·타이밍·검출·자원·플랫폼 기록 확인
+    assert s["timing_ms"]["budget_ms_at_14fps"] == round(1000.0 / 14.0, 2)
+    assert s["timing_ms"]["p95"] >= 0.0
+    assert "meets_budget_p95" in s["timing_ms"]
+    assert 0.0 <= s["detection"]["found_fraction"] <= 1.0
+    assert "backend" in s["resources"]
+    assert "is_raspberry_pi" in s["platform"]
+    # 산출물 파일 존재
+    assert (base / "bench_pi_frames.csv").exists()
+    assert (base / "bench_pi_summary.json").exists()
+    assert (base / "bench_pi_report.txt").exists()
+
+
 def _strip_timing(csv_text: str) -> list[list[str]]:
     out = []
     for i, line in enumerate(csv_text.strip().splitlines()):
@@ -443,4 +468,5 @@ if __name__ == "__main__":
     test_center_roi_absorbs_gimbal_offset()
     test_gimbal_scenes_additive()
     test_lite_tracker_end_to_end_and_relative_motion()
+    test_bench_pi_smoke_and_reuses_interface()
     print("ALL TESTS PASSED")
