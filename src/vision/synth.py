@@ -670,6 +670,64 @@ def descend_view_scenes() -> list[SceneConfig]:
     ]
 
 
+# --- 짐벌 연동 추적 시나리오 (14 fps, Pi Zero 2W 목표. camera_geometry.md 기반) ---
+# primary 추적은 짐벌(github.com/smchoi02/gimbal_control)이 GPS/IMU로 카메라를
+# 표적 방향에 두고, 이 합성영상은 그 짐벌이 남긴 잔여 지향 오차 하에서 표적이
+# 화면 중앙 근처(오차만큼 벗어난 위치)에 나타나도록 만든다. 14 fps로 촬영을 가정.
+# 표적은 페이로드 자신의 drogue→main 순차 전개(본체와 동일 구속조건)를 재현.
+def _gimbal_sequence(far: bool = False) -> DeploymentSequence:
+    """페이로드의 drogue→main 순차 전개. far=True면 원거리(작은 표적).
+
+    가정(configs/parachute_specs.md, camera_geometry.md): 페이로드도 본체와 동일하게
+    3 ft drogue + main, 1.5 kg, drogue≥20 / main≤11 m/s. 낙하 속도가 빠를수록
+    (drogue 단계) 더 빨리 멀어져 diameter_growth<1(축소)이 크고, main 단계는
+    저속이라 축소가 완만하다.
+    """
+    drg_d = 34.0 if far else 64.0
+    main_d = 40.0 if far else 84.0
+    return DeploymentSequence(stages=[
+        Stage(
+            target=drogue_target(
+                start_center=(300.0, 210.0), start_diameter=drg_d,
+                velocity_px=(0.2, 0.4),
+                diameter_growth_per_frame=0.992,   # 고속 → 빠르게 멀어짐(축소)
+                swing_amp_px=5.0, swing_period_frames=22.0,
+                rotate_deg_per_frame=2.6, wind_drift_px=0.1),
+            inflate_frames=10, inflate_from=0.3, hold_frames=16, overlap_frames=0,
+        ),
+        Stage(
+            target=main_target(
+                start_center=(300.0, 230.0), start_diameter=main_d,
+                velocity_px=(0.15, 0.3),
+                diameter_growth_per_frame=0.998,   # 저속 → 완만하게 멀어짐
+                swing_amp_px=9.0, swing_period_frames=42.0,
+                rotate_deg_per_frame=1.0, wind_drift_px=0.12),
+            inflate_frames=24, inflate_from=0.2, hold_frames=30, overlap_frames=0,
+        ),
+    ])
+
+
+def gimbal_scenes() -> list[SceneConfig]:
+    """짐벌 연동 추적용 14 fps 시나리오(추가 경로). 표적은 화면 중앙 부근.
+
+    실제 센서는 4608×2592지만 합성/처리 부담을 줄이려 640×480으로 렌더한다.
+    짐벌 잔여 오차·ROI 크롭·상대속도 로직은 해상도 무관하며, 메타에 실제 해상도
+    가정을 기록한다. tracker_lite가 이 영상에서 표적을 잡아 상대운동을 낸다.
+    """
+    seq = _gimbal_sequence(far=False)
+    seq_far = _gimbal_sequence(far=True)
+    return [
+        # 근~중거리: drogue→main 순차 전개, 표적 중앙 부근, 14fps
+        SceneConfig(name="gimbal_seq_track", fps=14.0, frames=seq.total_frames(),
+                    sequence=seq, realism=irec_realism()),
+        # 원거리: 표적 작음(추적 한계 시험), 아지랑이/노이즈 강함, 14fps
+        SceneConfig(name="gimbal_far_track", fps=14.0, frames=seq_far.total_frames(),
+                    sequence=seq_far,
+                    realism=irec_realism(heat_shimmer=1.1, sensor_noise=7.0,
+                                         jpeg_quality=72, clouds=0.3)),
+    ]
+
+
 # --- 회귀/시연 시나리오 ---
 def regression_scenes() -> list[SceneConfig]:
     return [
@@ -716,9 +774,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     out_dir = Path(args.out)
-    # 기존 회귀 + 시퀀스 + IREC 사실성 + 3D mesh + 관측각-하강 시나리오(모두 추가 경로).
+    # 기존 회귀 + 시퀀스 + IREC 사실성 + 3D mesh + 관측각-하강 + 짐벌 연동(모두 추가 경로).
     scenes = (regression_scenes() + sequence_scenes() + irec_scenes()
-              + mesh_scenes() + descend_view_scenes())
+              + mesh_scenes() + descend_view_scenes() + gimbal_scenes())
     if args.scene != "all":
         scenes = [s for s in scenes if s.name == args.scene]
         if not scenes:

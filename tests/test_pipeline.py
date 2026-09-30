@@ -316,6 +316,80 @@ def _to_hsv(bgr):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype("float32")
 
 
+# ===================================================================
+# 짐벌 연동 경량 추적기 테스트 (추가 경로) — 기존 테스트는 그대로 보존.
+# ===================================================================
+def test_gimbal_error_model_offset_and_sigma():
+    """짐벌 오차 모델: 종합 1σ가 합리적 범위(수 도), 오프셋이 각→픽셀로 환산된다."""
+    import random
+    from vision.gimbal import GimbalErrorModel
+    g = GimbalErrorModel(seed=0)
+    sig = g.sigma_total_deg()
+    assert 1.0 < sig < 6.0, f"종합 지향 오차 1σ가 수 도 범위여야 함: {sig}"
+    d = g.as_dict()
+    assert d["static_offset_px"] > 30.0, f"정렬 잔차가 유의미한 px 오프셋이어야 함: {d}"
+    rng = random.Random(0)
+    dx, dy = g.offset_px(10, 14.0, rng)
+    assert abs(dx) < 5000 and abs(dy) < 5000
+
+
+def test_relative_motion_classification():
+    """상대속도: 커지면 APPROACH, 작아지면 RECEDE, 변화 작으면 HOLD."""
+    from vision.tracker_lite import relative_scale_rate, classify_relative_motion
+    dt = 1.0 / 14.0
+    approach = relative_scale_rate(100.0, 110.0, dt)
+    recede = relative_scale_rate(100.0, 90.0, dt)
+    steady = relative_scale_rate(100.0, 100.05, dt)
+    assert classify_relative_motion(approach) == "APPROACH"
+    assert classify_relative_motion(recede) == "RECEDE"
+    assert classify_relative_motion(steady) == "HOLD"
+
+
+def test_center_roi_absorbs_gimbal_offset():
+    """ROI 크롭이 짐벌 오프셋 위치를 중심으로 잡아, 풀프레임을 복사하지 않는다."""
+    from vision.tracker_lite import center_roi, RoiConfig
+    cfg = RoiConfig(roi_size=512)
+    rx, ry, rw, rh = center_roi((2592, 4608, 3), cfg, gimbal_offset=(200.0, -150.0))
+    assert 0 <= rx and 0 <= ry and rw <= 512 and rh <= 512
+    assert abs((rx + rw / 2) - (4608 / 2 + 200)) < 260
+
+
+def test_gimbal_scenes_additive():
+    """짐벌 시나리오가 추가되고 14fps이며 이름 충돌이 없다."""
+    gs = {s.name for s in synth.gimbal_scenes()}
+    assert gs == {"gimbal_seq_track", "gimbal_far_track"}
+    others = ({s.name for s in synth.regression_scenes()} |
+              {s.name for s in synth.sequence_scenes()} |
+              {s.name for s in synth.irec_scenes()} |
+              {s.name for s in synth.mesh_scenes()} |
+              {s.name for s in synth.descend_view_scenes()})
+    assert gs.isdisjoint(others), "짐벌 시나리오 이름은 기존과 겹치면 안 됨"
+    for s in synth.gimbal_scenes():
+        assert s.fps == 14.0, "촬영 14 fps 전제"
+
+
+def test_lite_tracker_end_to_end_and_relative_motion():
+    """경량 추적기 end-to-end: 짐벌 오프셋 하에서 표적을 잡고 상대운동을 낸다."""
+    base = ROOT / "output" / "_test_tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    scene = [s for s in synth.gimbal_scenes() if s.name == "gimbal_seq_track"][0]
+    scene.frames = min(scene.frames, 40)
+    synth.generate(scene, base)
+    video = base / "gimbal_seq_track.mp4"
+    assert video.exists()
+
+    from vision.analyze_lite import run_lite
+    meta = run_lite(str(video), str(base / "run_lite"), roi_size=512, proc_max=256,
+                    use_gimbal_error=True, seed=0)
+    assert meta["found_fraction"] >= 0.5, f"검출률이 낮음: {meta['found_fraction']}"
+    assert meta["timing_ms"]["p50"] >= 0.0 and meta["timing_ms"]["budget_at_fps"] > 0
+    import csv as _csv
+    rows = list(_csv.DictReader((base / "run_lite" / "gimbal_seq_track_lite.csv")
+                                .read_text(encoding="utf-8").splitlines()))
+    labels = {r["rel_motion"] for r in rows}
+    assert labels & {"APPROACH", "RECEDE", "HOLD", "LOST"}, f"상대운동 라벨 없음: {labels}"
+
+
 def _strip_timing(csv_text: str) -> list[list[str]]:
     out = []
     for i, line in enumerate(csv_text.strip().splitlines()):
@@ -364,4 +438,9 @@ if __name__ == "__main__":
     test_view_elev_interpolation()
     test_descend_view_scenes_additive_and_varying()
     test_descend_view_projection_changes()
+    test_gimbal_error_model_offset_and_sigma()
+    test_relative_motion_classification()
+    test_center_roi_absorbs_gimbal_offset()
+    test_gimbal_scenes_additive()
+    test_lite_tracker_end_to_end_and_relative_motion()
     print("ALL TESTS PASSED")
